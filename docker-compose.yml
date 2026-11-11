@@ -1,0 +1,148 @@
+services:
+  # ---------------------------------------------------------------------------
+  # 1. FASTAPI (MaBanque API)
+  # ---------------------------------------------------------------------------
+  fastapi_app:
+    build:
+      context: ./apps/fastapi_app
+      dockerfile: Dockerfile
+    container_name: aiops_fastapi
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./apps/fastapi_app:/app
+    environment:
+      - KAFKA_ENABLED=true
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC_LOGS=aiops-logs
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # 2. AGENT DE MÉTRIQUES (Psutil)
+  # ---------------------------------------------------------------------------
+  metrics_agent:
+    build:
+      context: ./apps/metrics_agent
+      dockerfile: Dockerfile
+    container_name: aiops_metrics_agent
+    volumes:
+      - ./apps/metrics_agent:/app
+    environment:
+      - KAFKA_ENABLED=true
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC_METRICS=aiops-metrics
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # 3. BROKER KAFKA (Apache officiel, KRaft)
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: aiops_kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Limiter la mémoire JVM à 256 MB
+      KAFKA_HEAP_OPTS: -Xmx256m -Xms256m
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # 4. INITIALISATION DES TOPICS
+  # ---------------------------------------------------------------------------
+  init-kafka:
+    image: apache/kafka:3.7.0
+    container_name: aiops_init_kafka
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "
+      echo 'Création des topics Kafka...' &&
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic aiops-logs --partitions 1 --replication-factor 1 &&
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic aiops-metrics --partitions 1 --replication-factor 1 &&
+      echo 'Liste des topics disponibles :' &&
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
+      "
+
+    # ---------------------------------------------------------------------------
+  # 5. PROCESSUR SPARK STREAMING (Architecture Medaillon Bronze/Silver/Gold)
+  # ---------------------------------------------------------------------------
+  spark_processor:
+    build:
+      context: ./spark_processor
+      dockerfile: Dockerfile
+    container_name: aiops_spark
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    volumes:
+      - ./storage:/app/storage
+    depends_on:
+      kafka:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 750M    
+  # ---------------------------------------------------------------------------
+  # 6. EXPORTATEUR DE MÉTRIQUES ISOLE (Pour Grafana)
+  # ---------------------------------------------------------------------------
+  monitoring_exporter:
+    build:
+      context: ./apps/monitoring_exporter
+      dockerfile: Dockerfile
+    container_name: aiops_exporter
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./apps/monitoring_exporter:/app
+      - ./storage:/app/storage
+    command: uvicorn main:app --host 0.0.0.0 --port 8002 --reload
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 400M
+
+  # ---------------------------------------------------------------------------
+  # 7. GRAFANA (Visualisation)
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: aiops_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=yesoreyeram-infinity-datasource
+    depends_on:
+      - monitoring_exporter
+    deploy:
+      resources:
+        limits:
+          memory: 300M
